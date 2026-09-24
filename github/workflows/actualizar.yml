@@ -1,1 +1,37 @@
+name: Actualizar calendario CAP Ciudad de Murcia
 
+on:
+  schedule:
+    # Todos los días a las 06:00 UTC. Ajusta la hora si quieres que se
+    # actualice en otro momento del día.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}   # permite lanzarlo a mano desde la pestaña "Actions"
+
+permissions:
+  contents: write   # necesario para que el workflow pueda hacer commit/push
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Generar el calendario (.ics)
+        run: python actualizar_calendario_cap_murcia.py
+
+      - name: Publicar el .ics si ha cambiado
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cap_ciudad_de_murcia.ics
+          git diff --staged --quiet || git commit -m "Actualizar calendario CAP Ciudad de Murcia"
+          git push
