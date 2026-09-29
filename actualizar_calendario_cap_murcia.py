@@ -89,6 +89,14 @@ def extraer_partidos_equipo(html: str, jornada: int):
         fecha_txt = limpiar_texto(horarios[0].get_text()) if len(horarios) > 0 else ""
         hora_txt = limpiar_texto(horarios[1].get_text()) if len(horarios) > 1 else ""
 
+        # Enlace al acta oficial del partido (para consultar el resultado
+        # una vez jugado, ya que el marcador en la web viene ofuscado)
+        acta_url = ""
+        enlace_acta = tabla.find("a", href=re.compile(r"NFG_CmpPartido"))
+        if enlace_acta:
+            href = enlace_acta["href"]
+            acta_url = href if href.startswith("http") else f"{BASE_URL}{href}"
+
         # Campo y árbitro: fila siguiente, colspan=9
         campo = ""
         arbitro = ""
@@ -116,6 +124,7 @@ def extraer_partidos_equipo(html: str, jornada: int):
             "hora_txt": hora_txt,
             "campo": campo,
             "arbitro": arbitro,
+            "acta_url": acta_url,
             "uid": uid_base,
         })
 
@@ -157,7 +166,11 @@ def construir_calendario(todos_los_partidos):
         descripcion = f"Jornada {p['jornada']} - Primera Autonómica, Grupo Segundo"
         if p["arbitro"]:
             descripcion += f"\nÁrbitro: {p['arbitro']}"
+        if p["acta_url"]:
+            descripcion += f"\nActa del partido: {p['acta_url']}"
         evento.add("description", descripcion)
+        if p["acta_url"]:
+            evento.add("url", p["acta_url"])
         cal.add_component(evento)
 
     return cal
