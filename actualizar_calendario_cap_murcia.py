@@ -340,6 +340,16 @@ def main():
         resultado = extraer_resultado_desde_acta(resp.text)
         if resultado:
             p["resultado"] = resultado
+        else:
+            pistas = {
+                "status": resp.status_code,
+                "longitud": len(resp.text),
+                "tiene_Titulares": "Titulares" in resp.text,
+                "tiene_Goles": ">Goles<" in resp.text,
+                "tiene_td_widgetL": "td_widgetL" in resp.text,
+                "tiene_font20px": "font-size: 20px" in resp.text,
+            }
+            print(f"[aviso] Jornada {p['jornada']}: no se dedujo resultado. Pistas: {pistas}", file=sys.stderr)
 
     cal = construir_calendario(todos_los_partidos)
     with open(ARCHIVO_SALIDA, "wb") as f:
