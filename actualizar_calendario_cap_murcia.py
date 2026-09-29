@@ -17,6 +17,7 @@ al final del mensaje) para que el .ics resultante se mantenga al día.
 
 import re
 import sys
+import unicodedata
 from datetime import datetime, timedelta
 
 import requests
@@ -141,6 +142,126 @@ def parsear_fecha_hora(fecha_txt: str, hora_txt: str):
         return None
 
 
+def _normalizar(txt: str) -> str:
+    txt = limpiar_texto(txt).upper()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", txt) if unicodedata.category(c) != "Mn"
+    )
+
+
+def extraer_resultado_desde_acta(html_acta: str):
+    """
+    Deduce el resultado real de un partido ya jugado SIN tocar los dígitos
+    ofuscados del marcador (que además parecen incluir señuelos deliberados).
+
+    En vez de eso, cruza cada goleador (texto plano, con su minuto) con las
+    alineaciones de cada equipo (también texto plano) para saber a qué
+    equipo pertenece cada gol, y así reconstruir el marcador contando goles.
+
+    Devuelve None si el acta no tiene todavía alineaciones/goles publicados
+    (partido aún no jugado), o un dict:
+        {
+            "local": nombre_local, "visitante": nombre_visitante,
+            "goles_local": int, "goles_visitante": int,
+            "goleadores": [(minuto:int, nombre:str, equipo:"local"|"visitante"), ...]
+        }
+    """
+    soup = BeautifulSoup(html_acta, "html.parser")
+
+    cabecera = soup.find("table", width="100%")
+    if not cabecera:
+        return None
+    celdas_cab = cabecera.find_all("td", class_=re.compile(r"td_widget[LV]"))
+    if len(celdas_cab) < 2:
+        return None
+    nombre_local = limpiar_texto(celdas_cab[0].get_text())
+    nombre_visitante = limpiar_texto(celdas_cab[-1].get_text())
+
+    # Localizar los dos paneles de plantilla (uno por equipo) y construir,
+    # para cada uno, el conjunto de nombres de jugadores (titulares+suplentes)
+    plantillas = {}  # nombre_equipo_normalizado -> set(nombres normalizados)
+    for panel in soup.find_all("div", class_="number", style=re.compile("font-size: 20px")):
+        nombre_panel = limpiar_texto(panel.get_text())
+        if nombre_panel in ("Árbitros", "Goles"):
+            continue
+        contenedor = panel.find_parent("div", class_="details")
+        if not contenedor:
+            continue
+        jugadores = set()
+        for fila in contenedor.find_all("tr", onclick=re.compile(r"NFG_EstadisticasJugador")):
+            tds = fila.find_all("td")
+            if len(tds) >= 2:
+                jugadores.add(_normalizar(tds[1].get_text()))
+        if jugadores:
+            plantillas[_normalizar(nombre_panel)] = jugadores
+
+    if not plantillas:
+        return None  # el acta no tiene alineaciones -> partido no jugado (aún)
+
+    # Localizar la tabla de goles
+    panel_goles = None
+    for panel in soup.find_all("div", class_="number"):
+        if limpiar_texto(panel.get_text()) == "Goles":
+            panel_goles = panel.find_parent("div", class_="details")
+            break
+    if panel_goles is None:
+        return None
+
+    goles_local = 0
+    goles_visitante = 0
+    goleadores = []
+
+    nombre_local_norm = _normalizar(nombre_local)
+    nombre_visitante_norm = _normalizar(nombre_visitante)
+
+    for fila in panel_goles.find_all("tr"):
+        celda_tipo = fila.find("td", attrs={"nowrap": True})
+        celda_info = fila.find_all("td")
+        if not celda_tipo or len(celda_info) < 2:
+            continue
+        enlace_tipo = celda_tipo.find("a", class_="lgol")
+        tipo = enlace_tipo.get("title", "Gol normal") if enlace_tipo else "Gol normal"
+
+        texto_info = limpiar_texto(celda_info[1].get_text())
+        m = re.match(r"\((\d+)'?\)\s*(.+)", texto_info)
+        if not m:
+            continue
+        minuto = int(m.group(1))
+        nombre_jugador = _normalizar(m.group(2))
+
+        equipo_jugador = None
+        for nombre_equipo_norm, jugadores in plantillas.items():
+            if nombre_jugador in jugadores:
+                equipo_jugador = "local" if nombre_equipo_norm == nombre_local_norm else "visitante"
+                break
+
+        if equipo_jugador is None:
+            continue  # no se ha podido identificar el equipo de este goleador
+
+        # Un gol en propia puerta se anota a favor del equipo RIVAL del goleador
+        es_propia = "propia" in tipo.lower()
+        equipo_beneficiado = equipo_jugador
+        if es_propia:
+            equipo_beneficiado = "visitante" if equipo_jugador == "local" else "local"
+
+        if equipo_beneficiado == "local":
+            goles_local += 1
+        else:
+            goles_visitante += 1
+
+        goleadores.append((minuto, m.group(2).strip(), equipo_jugador, es_propia))
+
+    goleadores.sort(key=lambda g: g[0])
+
+    return {
+        "local": nombre_local,
+        "visitante": nombre_visitante,
+        "goles_local": goles_local,
+        "goles_visitante": goles_visitante,
+        "goleadores": goleadores,
+    }
+
+
 def construir_calendario(todos_los_partidos):
     cal = Calendar()
     cal.add("prodid", "-//Calendario CAP Ciudad de Murcia//ffrm.es//ES")
@@ -156,18 +277,32 @@ def construir_calendario(todos_los_partidos):
 
         evento = Event()
         evento.add("uid", p["uid"] + "@ffrm-calendar")
-        titulo = f"{p['local']} vs {p['visitante']}"
+
+        resultado = p.get("resultado")
+        if resultado:
+            gl, gv = resultado["goles_local"], resultado["goles_visitante"]
+            titulo = f"{p['local']} {gl} - {gv} {p['visitante']}"
+        else:
+            titulo = f"{p['local']} vs {p['visitante']}"
         evento.add("summary", titulo)
+
         evento.add("dtstart", inicio)
         evento.add("dtend", inicio + DURACION_PARTIDO)
         evento.add("dtstamp", datetime.utcnow())
         if p["campo"]:
             evento.add("location", p["campo"])
+
         descripcion = f"Jornada {p['jornada']} - Primera Autonómica, Grupo Segundo"
         if p["arbitro"]:
             descripcion += f"\nÁrbitro: {p['arbitro']}"
+        if resultado and resultado["goleadores"]:
+            descripcion += "\n\nGoles:"
+            for minuto, nombre, equipo, es_propia in resultado["goleadores"]:
+                equipo_txt = p["local"] if equipo == "local" else p["visitante"]
+                sufijo = " (p.p.)" if es_propia else ""
+                descripcion += f"\n{minuto}' {nombre} ({equipo_txt}){sufijo}"
         if p["acta_url"]:
-            descripcion += f"\nActa del partido: {p['acta_url']}"
+            descripcion += f"\n\nActa del partido: {p['acta_url']}"
         evento.add("description", descripcion)
         if p["acta_url"]:
             evento.add("url", p["acta_url"])
@@ -189,12 +324,31 @@ def main():
         partidos = extraer_partidos_equipo(resp.text, jornada)
         todos_los_partidos.extend(partidos)
 
+    # Para los partidos ya jugados, intentar deducir el resultado real
+    # a partir del acta (goleadores + alineaciones, todo en texto plano)
+    ahora = datetime.now()
+    for p in todos_los_partidos:
+        inicio = parsear_fecha_hora(p["fecha_txt"], p["hora_txt"])
+        if inicio is None or inicio > ahora or not p["acta_url"]:
+            continue
+        try:
+            resp = requests.get(p["acta_url"], headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"[aviso] No se pudo descargar el acta de jornada {p['jornada']}: {e}", file=sys.stderr)
+            continue
+        resultado = extraer_resultado_desde_acta(resp.text)
+        if resultado:
+            p["resultado"] = resultado
+
     cal = construir_calendario(todos_los_partidos)
     with open(ARCHIVO_SALIDA, "wb") as f:
         f.write(cal.to_ical())
 
     confirmados = sum(1 for p in todos_los_partidos if parsear_fecha_hora(p["fecha_txt"], p["hora_txt"]))
+    con_resultado = sum(1 for p in todos_los_partidos if p.get("resultado"))
     print(f"Listo: {confirmados} partidos con fecha/hora confirmada de {len(todos_los_partidos)} encontrados.")
+    print(f"De ellos, {con_resultado} con resultado ya deducido del acta.")
     print(f"Calendario escrito en: {ARCHIVO_SALIDA}")
 
 
